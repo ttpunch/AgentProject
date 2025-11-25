@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: cnc_backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - /Users/vinodkumar/Desktop:/mnt/desktop
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=12345
+      - POSTGRES_DB=petro
+      - POSTGRES_HOST=192.168.29.165
+      - POSTGRES_PORT=5432
+      - MONGO_URI=mongodb://mongo:27017/cnc_logs
+    depends_on:
+      - mongo
+    networks:
+      - cnc_network
+
+  frontend:
+    build: ./frontend
+    container_name: cnc_frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - cnc_network
+
+  mongo:
+    image: mongo:6.0
+    container_name: cnc_mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - cnc_network
+
+networks:
+  cnc_network:
+    driver: bridge
+
+volumes:
+
+  mongo_data:
