@@ -365,11 +365,13 @@ def postgres_agent(state: AgentState):
         
         CRITICAL INSTRUCTIONS:
         1. Analyze the Error Message. It tells you exactly what went wrong.
-        2. If the error mentions a missing function (like ROUND with certain types), check data types and cast if necessary (e.g., ::numeric).
-        3. If the error mentions a missing column, check the Schema again.
-        4. Generate a CORRECTED SQL query that resolves the error.
+        2. If the error is "syntax error at end of input", it means you likely left a trailing comma or the query is incomplete. REMOVE trailing commas.
+        3. If the error mentions a missing function (like ROUND with certain types), check data types and cast if necessary (e.g., ::numeric).
+        4. If the error mentions a missing column, check the Schema again.
+        5. DO NOT include comments (starting with --) in the SQL.
+        6. Generate a CORRECTED SQL query that resolves the error.
         
-        Return ONLY the corrected raw SQL query. No markdown, no explanations.
+        Return ONLY the corrected raw SQL query. No markdown, no explanations, no comments.
         """
     else:
         print("--- Postgres Agent ---")
@@ -386,12 +388,20 @@ def postgres_agent(state: AgentState):
         2. Pay close attention to data types (e.g., don't compare strings to numbers).
         3. If the user asks for "machines", use the 'machines' table.
         4. If the user asks for sensor data, check if it's in 'cotmac_iiot' or other tables.
-        5. Return ONLY the raw SQL query. No markdown, no explanations.
+        5. DO NOT include comments (starting with --) in the SQL.
+        6. DO NOT end the query with a trailing comma.
+        7. Return ONLY the raw SQL query. No markdown, no explanations.
         """
     
     llm = get_llm(state.get("llm_provider"))
     response = llm.invoke([HumanMessage(content=prompt)])
     query = response.content.strip().replace("```sql", "").replace("```", "").strip()
+    
+    # Post-processing to remove comments and trailing commas
+    query_lines = [line for line in query.split('\n') if not line.strip().startswith('--')]
+    query = " ".join(query_lines).strip()
+    if query.endswith(','):
+        query = query[:-1]
     
     # Execution
     pg = PostgresConnector()
@@ -411,23 +421,69 @@ def mongo_agent(state: AgentState):
     question = state["question"]
     
     mongo = MongoConnector()
+    
+    # Generation
+    if state.get("error") and state.get("retry_count", 0) > 0:
+        print(f"--- Mongo Agent (Retry {state.get('retry_count')}) ---")
+        prompt = f"""
+        You are an expert MongoDB Data Analyst. Your previous pipeline failed.
+        
+        User Question: {question}
+        
+        Previous Error: {state['error']}
+        
+        Collection: 'sensor_logs'
+        Fields: timestamp, machine_id, vibration, temperature, pressure
+        
+        Task: Correct the MongoDB aggregation pipeline.
+        - Ensure correct JSON syntax.
+        - Ensure operators like $sort, $match, $limit are used correctly.
+        - Return ONLY the raw JSON list for the pipeline.
+        """
+    else:
+        prompt = f"""
+        You are an expert MongoDB Data Analyst.
+        
+        User Question: {question}
+        
+        Collection: 'sensor_logs'
+        Fields: timestamp, machine_id, vibration, temperature, pressure
+        
+        Task: Generate a MongoDB aggregation pipeline to answer the question.
+        - Return ONLY the raw JSON list for the pipeline.
+        - Example: [{{"$match": ...}}, {{"$sort": ...}}]
+        """
+
     try:
-        # For visualization, we want time-series data.
-        # Fetch last 20 records sorted by timestamp descending
-        pipeline = [
-            {"$sort": {"timestamp": -1}},
-            {"$limit": 20},
-            {"$sort": {"timestamp": 1}} # Sort back to ascending for the chart
-        ]
+        # If it's a retry, we ask the LLM to fix it. 
+        # For the first attempt, we use the hardcoded logic for visualization if applicable, 
+        # OR we could fully switch to LLM generation. 
+        # Given the "ReAct" request, let's try to use LLM generation for flexibility, 
+        # but keep the hardcoded fallback for simple "show me data" requests if needed.
+        # For now, let's stick to the specific request: "ReAct agent for Mongo".
+        
+        # NOTE: The original code had hardcoded pipeline for visualization. 
+        # To make it a true agent, we should let the LLM generate the pipeline, 
+        # but maybe hint it to include sorting for charts.
+        
+        llm = get_llm(state.get("llm_provider"))
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = response.content.strip()
+        
+        # Extract JSON
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+            
+        pipeline = json.loads(content)
+        
         df = mongo.aggregate("sensor_logs", pipeline)
         
         # Convert to list of dicts for chart_data
-        # Ensure timestamp is string for JSON serialization
         if not df.empty:
-            # Convert ObjectId to string
             if '_id' in df.columns:
                 df['_id'] = df['_id'].astype(str)
-            
             if 'timestamp' in df.columns:
                 df['timestamp'] = df['timestamp'].astype(str)
             chart_data = df.to_dict(orient='records')
@@ -436,8 +492,9 @@ def mongo_agent(state: AgentState):
             
         result = df.to_string()
         return {"query_result": result, "chart_data": chart_data, "error": None}
+        
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "retry_count": state.get("retry_count", 0) + 1}
     finally:
         mongo.close()
 
@@ -773,9 +830,14 @@ workflow.add_conditional_edges(
 def should_retry(state: AgentState):
     error = state.get("error")
     retry_count = state.get("retry_count", 0)
+    target = state.get("target_node") # We need to know which agent failed
     
     if error and retry_count < 3:
-        return "postgres_agent"
+        if target == "POSTGRES":
+            return "postgres_agent"
+        if target == "MONGO":
+            return "mongo_agent"
+            
     return "analyst"
 
 workflow.add_conditional_edges(
@@ -786,7 +848,16 @@ workflow.add_conditional_edges(
         "analyst": "analyst"
     }
 )
-workflow.add_edge("mongo_agent", "analyst")
+
+workflow.add_conditional_edges(
+    "mongo_agent",
+    should_retry,
+    {
+        "mongo_agent": "mongo_agent",
+        "analyst": "analyst"
+    }
+)
+
 workflow.add_edge("rag_agent", END) # RAG answers directly for now
 workflow.add_edge("forecaster", END) # Forecaster answers directly
 workflow.add_edge("analyst", END)
