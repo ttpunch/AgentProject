@@ -59,6 +59,69 @@ docker-compose exec backend python processing/pipeline.py
 *   **Frontend Dashboard**: [http://localhost:5173](http://localhost:5173)
 *   **Backend API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
 
+## 💻 Local Development Setup (No Docker)
+
+If you prefer to run the system locally without Docker, follow these steps.
+
+### Prerequisites
+*   Python 3.8+
+*   Node.js 16+
+*   PostgreSQL and MongoDB running locally or accessible via network.
+
+### 1. Backend Setup
+
+1.  **Navigate to the backend directory:**
+    ```bash
+    cd backend
+    ```
+
+2.  **Create a virtual environment:**
+    ```bash
+    python -m venv .venv
+    ```
+
+3.  **Activate the virtual environment:**
+    *   **Mac/Linux:**
+        ```bash
+        source .venv/bin/activate
+        ```
+    *   **Windows:**
+        ```bash
+        .venv\Scripts\activate
+        ```
+
+4.  **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+5.  **Configure Environment Variables:**
+    Ensure your database credentials match those in `app/main.py` or set them via environment variables (e.g., `POSTGRES_USER`, `MONGO_URI`).
+
+6.  **Start the Backend Server:**
+    ```bash
+    uvicorn app.main:app --reload
+    ```
+    The API will be available at [http://localhost:8000](http://localhost:8000).
+
+### 2. Frontend Setup
+
+1.  **Navigate to the frontend directory:**
+    ```bash
+    cd frontend
+    ```
+
+2.  **Install dependencies:**
+    ```bash
+    npm install
+    ```
+
+3.  **Start the Development Server:**
+    ```bash
+    npm run dev
+    ```
+    The dashboard will be available at [http://localhost:5173](http://localhost:5173).
+
 ## 📂 Project Structure
 
 ```
