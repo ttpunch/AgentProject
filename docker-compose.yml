@@ -9,15 +9,11 @@ services:
     volumes:
       - ./backend:/app
       - /Users/vinodkumar/Desktop:/mnt/desktop
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=12345
-      - POSTGRES_DB=petro
-      - POSTGRES_HOST=192.168.29.165
-      - POSTGRES_PORT=5432
-      - MONGO_URI=mongodb://mongo:27017/cnc_logs
+    env_file:
+      - ./backend/.env
     depends_on:
       - mongo
+
     networks:
       - cnc_network
 

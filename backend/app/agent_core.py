@@ -26,7 +26,7 @@ LLM_API_KEY = "docker"
 LLM_MODEL = "ai/qwen3:8B-Q4_K_M"
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "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") # Placeholder
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = "x-ai/grok-4.1-fast:free" # Example model
 
 # --- LLM Client Helper ---

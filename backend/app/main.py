@@ -10,6 +10,11 @@ from typing import List, Dict, Any
 from fastapi import UploadFile, File
 import shutil
 import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
 from app.rag_manager import rag_manager
 
 logger = setup_logger("API")
