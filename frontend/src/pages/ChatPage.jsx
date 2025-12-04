@@ -6,8 +6,10 @@ import remarkGfm from 'remark-gfm';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import html2pdf from 'html2pdf.js';
 import KnowledgeBaseModal from '../components/KnowledgeBaseModal';
+import { useAuth } from '../context/AuthContext';
 
 const ChatPage = () => {
+    const { user, token, logout, isAdmin } = useAuth();
     const [messages, setMessages] = useState([
         { role: 'agent', content: 'Hello! I am your AI Data Assistant. I can help you analyze machine performance, query databases, and troubleshoot anomalies.' }
     ]);
@@ -26,6 +28,36 @@ const ChatPage = () => {
     useEffect(() => {
         scrollToBottom();
     }, [messages, status]);
+
+    // Fetch chat history on mount using auth user
+    useEffect(() => {
+        const fetchHistory = async () => {
+            if (!user || !token) return;
+
+            try {
+                const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+                const res = await axios.get(`${apiUrl}/chat/my-history`, {
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                if (res.data && res.data.length > 0) {
+                    const historyMsgs = res.data.map(item => ({
+                        role: item.role,
+                        content: item.content,
+                        chart_data: item.metadata?.chart_data
+                    }));
+                    setMessages(historyMsgs);
+                }
+            } catch (err) {
+                console.error("Error fetching chat history:", err);
+            }
+        };
+        fetchHistory();
+    }, [user, token]);
+
+    const handleLogout = () => {
+        logout();
+        navigate('/login');
+    };
 
     const handleSubmit = async (e) => {
         e.preventDefault();
@@ -54,7 +86,8 @@ const ChatPage = () => {
                 body: JSON.stringify({
                     question: userMsg,
                     chat_history: chatHistory,
-                    llm_provider: llmProvider
+                    llm_provider: llmProvider,
+                    user_id: user?.id || 'anonymous' // Use authenticated user ID
                 }),
             });
 
@@ -229,7 +262,10 @@ const ChatPage = () => {
                     ← Dashboard
                 </button>
                 <h1 style={styles.title}>AI Data Agent</h1>
-                <div style={{ width: '200px', display: 'flex', gap: '10px', justifyContent: 'flex-end', alignItems: 'center' }}>
+                <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                    <span style={{ color: '#94a3b8', fontSize: '0.9rem' }}>
+                        👤 {user?.username}
+                    </span>
                     <select
                         value={llmProvider}
                         onChange={(e) => setLlmProvider(e.target.value)}
@@ -244,6 +280,22 @@ const ChatPage = () => {
                         title="Knowledge Base"
                     >
                         📚
+                    </button>
+                    {isAdmin && (
+                        <button
+                            onClick={() => navigate('/admin')}
+                            style={{ ...styles.iconBtn, backgroundColor: 'rgba(239, 68, 68, 0.2)' }}
+                            title="Admin Panel"
+                        >
+                            ⚙️
+                        </button>
+                    )}
+                    <button
+                        onClick={handleLogout}
+                        style={{ ...styles.iconBtn, backgroundColor: 'rgba(239, 68, 68, 0.2)' }}
+                        title="Logout"
+                    >
+                        🚪
                     </button>
                 </div>
             </header>

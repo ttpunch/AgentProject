@@ -21,3 +21,6 @@ scipy
 statsmodels
 xgboost
 mcp
+python-jose[cryptography]
+passlib[bcrypt]
+email-validator

@@ -27,7 +27,7 @@ LLM_MODEL = "ai/qwen3:8B-Q4_K_M"
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = "x-ai/grok-4.1-fast:free" # Example model
+OPENROUTER_MODEL = "tngtech/deepseek-r1t2-chimera:free" # Example model
 
 # --- LLM Client Helper ---
 def get_llm(provider: str = "local"):

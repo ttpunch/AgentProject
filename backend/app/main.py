@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +16,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.rag_manager import rag_manager
+from app.utils.chat_history import save_message, get_history
+from app.auth import (
+    UserCreate, UserLogin, Token, UserResponse, PasswordReset,
+    create_user, get_user_by_username, verify_password, create_access_token,
+    get_current_user, get_admin_user, get_all_users, update_user_password
+)
 
 logger = setup_logger("API")
 
@@ -43,6 +49,51 @@ def read_root():
 def health_check():
     logger.debug("Health check called")
     return {"status": "healthy"}
+
+# --- Auth Endpoints ---
+@app.post("/auth/register", response_model=dict)
+def register(user: UserCreate):
+    """Register a new user."""
+    result = create_user(user.username, user.email, user.password)
+    return {"message": "User registered successfully", "user": result}
+
+@app.post("/auth/login", response_model=Token)
+def login(user: UserLogin):
+    """Authenticate and return JWT token."""
+    db_user = get_user_by_username(user.username)
+    if not db_user or not verify_password(user.password, db_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    token = create_access_token({"sub": db_user["id"], "role": db_user["role"]})
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.get("/auth/me", response_model=UserResponse)
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Get current user info."""
+    return UserResponse(
+        id=current_user["id"],
+        username=current_user["username"],
+        email=current_user["email"],
+        role=current_user["role"]
+    )
+
+# --- Admin Endpoints ---
+@app.get("/admin/users")
+async def list_users(admin: dict = Depends(get_admin_user)):
+    """List all users (admin only)."""
+    return get_all_users()
+
+@app.put("/admin/users/{user_id}/password")
+async def reset_user_password(
+    user_id: str,
+    password_data: PasswordReset,
+    admin: dict = Depends(get_admin_user)
+):
+    """Reset a user's password (admin only)."""
+    success = update_user_password(user_id, password_data.new_password)
+    if not success:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "Password updated successfully"}
 
 @app.get("/machines")
 def get_machines():
@@ -190,6 +241,21 @@ class QuestionRequest(BaseModel):
     chat_history: List[Dict[str, str]] = []
     llm_provider: str = "local"
     thread_id: str = "1" # Default thread ID
+    user_id: str = "default_user" # Added user_id for persistence
+
+@app.get("/chat/history/{user_id}")
+def get_chat_history(user_id: str):
+    """
+    Retrieves chat history for a specific user.
+    """
+    return get_history(user_id)
+
+@app.get("/chat/my-history")
+async def get_my_chat_history(current_user: dict = Depends(get_current_user)):
+    """
+    Retrieves chat history for the authenticated user.
+    """
+    return get_history(current_user["id"])
 
 @app.post("/agent/stream")
 async def agent_stream(request: QuestionRequest):
@@ -197,8 +263,39 @@ async def agent_stream(request: QuestionRequest):
     Streams the agent's execution steps and final answer.
     """
     from app.agent_core import stream_question
+    
+    # Use user_id from request (for backward compatibility)
+    user_id = request.user_id
+    
+    # Save user question
+    save_message(user_id, "user", request.question)
+    
+    def stream_with_persistence():
+        full_answer = ""
+        chart_data = None
+        
+        for chunk in stream_question(request.question, request.chat_history, request.llm_provider, request.thread_id):
+            yield chunk
+            
+            # Parse chunk to accumulate answer
+            try:
+                import json
+                data = json.loads(chunk)
+                if data.get("type") == "answer":
+                    full_answer = data.get("content", "")
+                    chart_data = data.get("chart_data")
+            except:
+                pass
+        
+        # Save agent answer at the end
+        if full_answer:
+            metadata = {}
+            if chart_data:
+                metadata["chart_data"] = chart_data
+            save_message(user_id, "agent", full_answer, metadata)
+
     return StreamingResponse(
-        stream_question(request.question, request.chat_history, request.llm_provider, request.thread_id),
+        stream_with_persistence(),
         media_type="application/x-ndjson"
     )
 

@@ -35,6 +35,12 @@ class MongoConnector:
             self.connect()
         self.db[collection].insert_many(data)
 
+    def insert_one(self, collection: str, document: Dict[str, Any]):
+        """Insert a single document into collection."""
+        if not self.client:
+            self.connect()
+        self.db[collection].insert_one(document)
+
     def aggregate(self, collection: str, pipeline: List[Dict[str, Any]]) -> pd.DataFrame:
         """Run aggregation pipeline and return DataFrame."""
         if not self.client:
