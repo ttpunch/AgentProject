@@ -23,13 +23,50 @@ ChartJS.register(
     Filler
 );
 
-const SensorChart = ({ data, label, color }) => {
+const SensorChart = ({ data, label, color, valueKey }) => {
+    // Auto-detect value column if not specified
+    // Exclude common metadata keys and find the first numeric column
+    const metadataKeys = ['timestamp', 'datetime', 'id', '_id', 'machine_id'];
+
+    const detectValueKey = () => {
+        if (valueKey) return valueKey;
+        if (!data || data.length === 0) return 'value';
+
+        const firstRow = data[0];
+        const numericKey = Object.keys(firstRow).find(key => {
+            if (metadataKeys.includes(key.toLowerCase())) return false;
+            return typeof firstRow[key] === 'number';
+        });
+        return numericKey || 'value';
+    };
+
+    const actualValueKey = detectValueKey();
+
+    // Detect timestamp key
+    const detectTimestampKey = () => {
+        if (!data || data.length === 0) return 'timestamp';
+        const firstRow = data[0];
+        if (firstRow.timestamp) return 'timestamp';
+        if (firstRow.datetime) return 'datetime';
+        return Object.keys(firstRow).find(k => k.toLowerCase().includes('time')) || 'timestamp';
+    };
+
+    const timestampKey = detectTimestampKey();
+
     const chartData = {
-        labels: data.map(d => new Date(d.timestamp).toLocaleTimeString()),
+        labels: data.map(d => {
+            const ts = d[timestampKey];
+            if (!ts) return '';
+            try {
+                return new Date(ts).toLocaleTimeString();
+            } catch {
+                return String(ts);
+            }
+        }),
         datasets: [
             {
-                label: label,
-                data: data.map(d => d.value),
+                label: label || actualValueKey,
+                data: data.map(d => d[actualValueKey]),
                 borderColor: color,
                 backgroundColor: color + '20', // Add transparency
                 tension: 0.4,

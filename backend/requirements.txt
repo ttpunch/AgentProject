@@ -24,3 +24,4 @@ mcp
 python-jose[cryptography]
 passlib[bcrypt]
 email-validator
+mem0ai

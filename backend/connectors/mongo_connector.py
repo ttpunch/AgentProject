@@ -15,7 +15,12 @@ class MongoConnector:
     def connect(self):
         """Establish connection to MongoDB."""
         try:
-            self.client = MongoClient(self.uri)
+            self.client = MongoClient(
+                self.uri,
+                serverSelectionTimeoutMS=30000,  # 30 second server selection timeout
+                connectTimeoutMS=30000,  # 30 second connection timeout
+                socketTimeoutMS=60000  # 60 second socket timeout
+            )
             # Extract db name from URI or default
             db_name = self.uri.split('/')[-1] or "cnc_logs"
             self.db = self.client[db_name]

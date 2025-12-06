@@ -16,7 +16,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.rag_manager import rag_manager
-from app.utils.chat_history import save_message, get_history
+from app.utils.chat_history import (
+    save_message, get_history, 
+    create_thread, get_threads, get_thread_history, update_thread_title, delete_thread
+)
 from app.auth import (
     UserCreate, UserLogin, Token, UserResponse, PasswordReset,
     create_user, get_user_by_username, verify_password, create_access_token,
@@ -39,6 +42,11 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting CNC Predictive Maintenance API...")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Docker monitoring."""
+    return {"status": "ok"}
 
 @app.get("/")
 def read_root():
@@ -257,6 +265,34 @@ async def get_my_chat_history(current_user: dict = Depends(get_current_user)):
     """
     return get_history(current_user["id"])
 
+# --- Thread Management Endpoints ---
+
+@app.get("/threads")
+async def list_threads(current_user: dict = Depends(get_current_user)):
+    """List all threads for the authenticated user."""
+    return get_threads(current_user["id"])
+
+@app.post("/threads")
+async def create_new_thread(current_user: dict = Depends(get_current_user)):
+    """Create a new thread and return its ID."""
+    thread_id = create_thread(current_user["id"], "New Chat")
+    if not thread_id:
+        raise HTTPException(status_code=500, detail="Failed to create thread")
+    return {"thread_id": thread_id, "title": "New Chat"}
+
+@app.get("/threads/{thread_id}")
+async def get_thread_messages(thread_id: str, current_user: dict = Depends(get_current_user)):
+    """Get messages for a specific thread."""
+    return get_thread_history(current_user["id"], thread_id)
+
+@app.delete("/threads/{thread_id}")
+async def remove_thread(thread_id: str, current_user: dict = Depends(get_current_user)):
+    """Delete a thread and all its messages."""
+    success = delete_thread(current_user["id"], thread_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete thread")
+    return {"message": "Thread deleted successfully"}
+
 @app.post("/agent/stream")
 async def agent_stream(request: QuestionRequest):
     """
@@ -267,32 +303,57 @@ async def agent_stream(request: QuestionRequest):
     # Use user_id from request (for backward compatibility)
     user_id = request.user_id
     
-    # Save user question
-    save_message(user_id, "user", request.question)
+    # Determine if this is the first message in the thread (BEFORE saving new message)
+    is_first_message = False
+    if request.thread_id:
+        existing_msgs = get_thread_history(user_id, request.thread_id)
+        is_first_message = len(existing_msgs) == 0
+        print(f"DEBUG: Pre-save check - is_first_message={is_first_message}, thread_id={request.thread_id}, existing_count={len(existing_msgs)}")
+    
+    # Save user question with thread_id
+    save_message(user_id, "user", request.question, request.thread_id)
     
     def stream_with_persistence():
         full_answer = ""
         chart_data = None
         
-        for chunk in stream_question(request.question, request.chat_history, request.llm_provider, request.thread_id):
+        # Limit chat history to last 10 messages for performance
+        limited_history = request.chat_history[-10:] if request.chat_history else []
+        
+        for chunk in stream_question(request.question, limited_history, request.llm_provider, request.thread_id, user_id):
             yield chunk
             
             # Parse chunk to accumulate answer
             try:
                 import json
                 data = json.loads(chunk)
-                if data.get("type") == "answer":
+                if data.get("type") == "token":
+                    # Accumulate streaming tokens
+                    full_answer += data.get("content", "")
+                elif data.get("type") == "answer":
+                    # Direct answer (non-streaming)
                     full_answer = data.get("content", "")
                     chart_data = data.get("chart_data")
+                elif data.get("type") == "answer_end":
+                    # Streaming complete - chart_data might be here
+                    if data.get("chart_data"):
+                        chart_data = data.get("chart_data")
             except:
                 pass
         
         # Save agent answer at the end
+        print(f"DEBUG: Saving agent answer, length={len(full_answer)}, thread_id={request.thread_id}")
         if full_answer:
             metadata = {}
             if chart_data:
                 metadata["chart_data"] = chart_data
-            save_message(user_id, "agent", full_answer, metadata)
+            save_message(user_id, "agent", full_answer, request.thread_id, metadata)
+        
+        # Update thread title if this is the first message
+        print(f"DEBUG: is_first_message={is_first_message}, thread_id={request.thread_id}")
+        if is_first_message and request.thread_id:
+            print(f"DEBUG: Updating thread title to: {request.question[:50]}")
+            update_thread_title(request.thread_id, request.question)
 
     return StreamingResponse(
         stream_with_persistence(),

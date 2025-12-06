@@ -19,6 +19,27 @@ from datetime import datetime, timedelta
 from app.rag_manager import rag_manager
 from app.agents.data_scientist import DataScienceAgent
 from app.mcp_manager import mcp_manager
+from mem0 import Memory
+
+# --- Mem0 Configuration ---
+config = {
+    "vector_store": {
+        "provider": "qdrant",
+        "config": {
+            "collection_name": "cnc_memory_v2",
+            "host": "cnc_qdrant",
+            "port": 6333,
+            "embedding_model_dims": 384
+        }
+    },
+    "embedder": {
+        "provider": "huggingface",
+        "config": {
+            "model": "sentence-transformers/all-MiniLM-L6-v2"
+        }
+    }
+}
+memory = Memory.from_config(config)
 
 # --- Configuration ---
 LLM_BASE_URL = "http://host.docker.internal:12434/engines/v1"
@@ -38,7 +59,9 @@ def get_llm(provider: str = "local"):
             api_key=OPENROUTER_API_KEY,
             model=OPENROUTER_MODEL,
             temperature=0,
-            streaming=True
+            streaming=True,
+            request_timeout=240,  # 4 minute timeout
+            max_retries=3  # Retry up to 3 times on failure
         )
     else:
         # Default to Local Docker LLM
@@ -47,7 +70,9 @@ def get_llm(provider: str = "local"):
             api_key=LLM_API_KEY,
             model=LLM_MODEL,
             temperature=0,
-            streaming=True
+            streaming=True,
+            request_timeout=240,  # 4 minute timeout
+            max_retries=3  # Retry up to 3 times on failure
         )
 
 # --- State Definition ---
@@ -69,12 +94,32 @@ class AgentState(TypedDict):
     mcp_tool_name: str
     mcp_server_name: str
     mcp_arguments: Dict[str, Any]
+    user_id: str
+    stream_response: bool
+    stream_prompt: str
 
 # --- Nodes ---
+
+# Global Schema Cache
+schema_cache = {
+    "postgres": None,
+    "mongo": None,
+    "last_updated": 0
+}
+SCHEMA_TTL = 300  # 5 minutes
 
 def schema_loader(state: AgentState):
     """Loads schema from Postgres and Mongo to provide context."""
     print("--- Loading Schema ---")
+    
+    import time
+    global schema_cache
+    
+    current_time = time.time()
+    if schema_cache["postgres"] and (current_time - schema_cache["last_updated"] < SCHEMA_TTL):
+        print("DEBUG: Using cached schema")
+        return {"schema_context": schema_cache["postgres"] + "\n\n" + schema_cache["mongo"]}
+
     # Postgres Schema
     pg = PostgresConnector()
     try:
@@ -97,6 +142,7 @@ def schema_loader(state: AgentState):
             schema_lines.append(f"  - {row['column_name']} ({row['data_type']})")
             
         pg_schema = "Postgres Schema:\n" + "\n".join(schema_lines)
+        schema_cache["postgres"] = pg_schema
     except Exception as e:
         pg_schema = f"Postgres Error: {e}"
     finally:
@@ -107,19 +153,67 @@ def schema_loader(state: AgentState):
     try:
         # Simplified mongo schema
         mongo_schema = "MongoDB Collection 'sensor_logs' has fields: timestamp, machine_id, vibration, temperature, pressure."
+        schema_cache["mongo"] = mongo_schema
     except Exception as e:
         mongo_schema = f"Mongo Error: {e}"
     finally:
         mongo.close()
 
+    # Update cache timestamp
+    schema_cache["last_updated"] = time.time()
+
     combined_schema = f"{pg_schema}\n{mongo_schema}"
     return {"schema_context": combined_schema}
+
+def summarize_history(history: List[Dict[str, str]], llm) -> List[Dict[str, str]]:
+    """Summarizes older chat history to save tokens."""
+    MAX_HISTORY = 10
+    if len(history) <= MAX_HISTORY:
+        return history
+    
+    print(f"--- Summarizing History (Length: {len(history)}) ---")
+    
+    # Keep the last 5 messages intact
+    recent_messages = history[-5:]
+    older_messages = history[:-5]
+    
+    # Convert older messages to string for summarization
+    history_text = "\n".join([f"{msg.get('role', 'unknown')}: {msg.get('content', '')}" for msg in older_messages])
+    
+    prompt = f"""
+    Summarize the following conversation history concisely. 
+    Preserve key details like machine IDs, specific issues, and user preferences.
+    
+    History:
+    {history_text}
+    """
+    
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        summary = response.content.strip()
+        print(f"DEBUG: Generated Summary: {summary}")
+        
+        # Create a summary message
+        summary_message = {"role": "system", "content": f"Previous conversation summary: {summary}"}
+        
+        return [summary_message] + recent_messages
+    except Exception as e:
+        print(f"Error summarizing history: {e}")
+        return history[-MAX_HISTORY:] # Fallback to simple truncation
+
 
 def router_node(state: AgentState):
     """Decides where to route the question using static context."""
     print("--- Router Node ---")
     question = state["question"]
     chat_history = state.get("chat_history", [])
+    
+    # Apply Summarization Middleware
+    llm = get_llm(state.get("llm_provider"))
+    chat_history = summarize_history(chat_history, llm)
+    
+    # Update state with summarized history so downstream nodes use it
+    state["chat_history"] = chat_history
     
     # Static description of the system for routing without loading schema
     system_context = """
@@ -147,8 +241,28 @@ def router_node(state: AgentState):
        - Use this if the user asks to perform an action outside the database (e.g., "list files", "read file").
     """
     
+    # Retrieve User Memory
+    user_id = state.get("user_id", "default_user")
+    memory_context = ""
+    try:
+        memories = memory.search(question, user_id=user_id)
+        if memories:
+            memory_lines = []
+            for m in memories:
+                if isinstance(m, dict) and 'memory' in m:
+                    memory_lines.append(f"- {m['memory']}")
+                elif isinstance(m, str):
+                    memory_lines.append(f"- {m}")
+            if memory_lines:
+                memory_context = "\nRelevant User Memories:\n" + "\n".join(memory_lines)
+    except Exception as e:
+        print(f"Memory search error: {e}")
+        memory_context = ""
+    
     prompt = f"""
     {system_context}
+    
+    {memory_context}
     
     Chat History:
     {chat_history}
@@ -197,7 +311,14 @@ def router_node(state: AgentState):
        - "Anomaly detection", "Outliers", "Weird behavior"
        - "RUL", "Remaining Useful Life", "Time to failure"
        - "Forecast", "Predict future", "What will happen next"
+     6. Return 'DATA_SCIENCE' if the question is about:
+       - "Anomaly detection", "Outliers", "Weird behavior"
+       - "RUL", "Remaining Useful Life", "Time to failure"
+       - "Forecast", "Predict future", "What will happen next"
        - "Correlation", "FFT", "Frequency analysis"
+       - "Analysis", "Statistics", "Trends", "Report", "Summary"
+       - "Big Data", "Spark", "Batch processing"
+       - "Average", "Mean", "Max", "Min" over a *time period* (e.g., "monthly average").
 
      7. Return 'MCP' if the question requires external tools (filesystem, etc.).
        
@@ -390,11 +511,17 @@ def postgres_agent(state: AgentState):
         4. If the user asks for sensor data, check if it's in 'cotmac_iiot' or other tables.
         5. DO NOT include comments (starting with --) in the SQL.
         6. DO NOT end the query with a trailing comma.
-        7. Return ONLY the raw SQL query. No markdown, no explanations.
+        7. INTELLIGENT QUERYING:
+           - If the user asks for an "average", "count", "sum", "max", or "min", use SQL AGGREGATION functions.
+           - DO NOT 'SELECT *' on large tables unless explicitly asked.
+        8. Return ONLY the raw SQL query. No markdown, no explanations.
         """
     
-    llm = get_llm(state.get("llm_provider"))
+    llm_provider = state.get("llm_provider", "local")
+    llm = get_llm(llm_provider)
+    print(f"DEBUG: invoking LLM (provider={llm_provider}) with prompt length query={len(prompt)} chars")
     response = llm.invoke([HumanMessage(content=prompt)])
+    print(f"DEBUG: LLM Response for Postgres: '{response.content}'")
     query = response.content.strip().replace("```sql", "").replace("```", "").strip()
     
     # Post-processing to remove comments and trailing commas
@@ -403,13 +530,42 @@ def postgres_agent(state: AgentState):
     if query.endswith(','):
         query = query[:-1]
     
+    if not query or not query.strip():
+        return {"sql_query": query, "error": "Generated query was empty after processing.", "retry_count": state.get("retry_count", 0) + 1}
+    
     # Execution
     pg = PostgresConnector()
     try:
         df = pg.fetch_query(query)
-        result = df.to_string()
+        
+        # --- Context Length Safety Net ---
+        # --- Context Length Safety Net ---
+        MAX_ROWS = 50
+        # No frontend limit as per user request (was 2000)
+        # FRONTEND_LIMIT = 2000
+        
+        # Prepare Chart Data for Frontend (Visuals)
+        chart_data = []
+        if not df.empty:
+            # Prepare full data (unlimited)
+            chart_df = df.copy()
+            # Ensure timestamps are string formatted for JSON
+            for col in chart_df.columns:
+                 if pd.api.types.is_datetime64_any_dtype(chart_df[col]):
+                     chart_df[col] = chart_df[col].astype(str)
+            chart_data = chart_df.to_dict(orient='records')
+        
+        # Prapare Text Result for LLM (Reasoning)
+        total_rows = len(df)
+        if total_rows > MAX_ROWS:
+            result = f"Query successfully returned {total_rows} rows. Showing the first {MAX_ROWS} rows below:\n\n"
+            result += df.head(MAX_ROWS).to_string()
+            result += f"\n\n(Note: All {total_rows} rows have been sent to the dashboard for visualization. Review the chart/table above for the full dataset.)"
+        else:
+            result = f"Query successfully returned {total_rows} rows:\n" + df.to_string()
+            
         # Clear error on success
-        return {"sql_query": query, "query_result": result, "error": None}
+        return {"sql_query": query, "query_result": result, "chart_data": chart_data, "error": None}
     except Exception as e:
         return {"sql_query": query, "error": str(e), "retry_count": state.get("retry_count", 0) + 1}
     finally:
@@ -450,8 +606,11 @@ def mongo_agent(state: AgentState):
         Fields: timestamp, machine_id, vibration, temperature, pressure
         
         Task: Generate a MongoDB aggregation pipeline to answer the question.
+        - INTELLIGENT AGGREGATION:
+          - If the user asks for "average", "stats", "counts", prefer using $group and $avg/$sum.
+          - If listing logs, do not artificially limit results unless explicit asked.
         - Return ONLY the raw JSON list for the pipeline.
-        - Example: [{{"$match": ...}}, {{"$sort": ...}}]
+        - Example: [{"$match": ...}, {"$sort": ...}]
         """
 
     try:
@@ -490,7 +649,16 @@ def mongo_agent(state: AgentState):
         else:
             chart_data = []
             
-        result = df.to_string()
+        # --- Context Length Safety Net ---
+        MAX_ROWS = 50
+        total_rows = len(df)
+        if total_rows > MAX_ROWS:
+            result = f"Pipeline successfully returned {total_rows} documents. Showing the first {MAX_ROWS} below:\n\n"
+            result += df.head(MAX_ROWS).to_string()
+            result += f"\n\n(Note: All {total_rows} documents have been sent to the dashboard for visualization. Review the chart/table above for the full dataset.)"
+        else:
+             result = f"Pipeline successfully returned {total_rows} documents:\n" + df.to_string()
+            
         return {"query_result": result, "chart_data": chart_data, "error": None}
         
     except Exception as e:
@@ -708,15 +876,13 @@ def general_chat(state: AgentState):
         except Exception as e:
             return {"final_answer": f"Error fetching MCP information: {e}"}
     
-    # Regular chat
-    prompt = f"""
-    You are a helpful assistant for a CNC Predictive Maintenance System.
-    Chat History: {state.get('chat_history', [])}
-    User said: {state['question']}
-    """
-    llm = get_llm(state.get("llm_provider"))
-    response = llm.invoke([HumanMessage(content=prompt)])
-    return {"final_answer": response.content}
+    # Regular chat - return flag to enable token streaming
+    return {
+        "stream_response": True,
+        "stream_prompt": f"""You are a helpful assistant for a CNC Predictive Maintenance System.
+Chat History: {state.get('chat_history', [])}
+User said: {state['question']}"""
+    }
 
 def ds_router(state: AgentState):
     """Routes to Spark or Pandas engine."""
@@ -886,14 +1052,16 @@ def process_question(question: str, thread_id: str = "1"):
 
 
 
-def stream_question(question: str, chat_history: List[Dict[str, str]] = [], llm_provider: str = "local", thread_id: str = "1"):
+def stream_question(question: str, chat_history: List[Dict[str, str]] = [], llm_provider: str = "local", thread_id: str = "1", user_id: str = "default_user"):
     """Streams the execution steps of the agent."""
-    print(f"DEBUG: Streaming question: {question} with history length: {len(chat_history)} using {llm_provider} thread: {thread_id}")
-    inputs = {"question": question, "chat_history": chat_history, "retry_count": 0, "llm_provider": llm_provider}
+    print(f"DEBUG: Streaming question: {question} with history length: {len(chat_history)} using {llm_provider} thread: {thread_id} user: {user_id}")
+    inputs = {"question": question, "chat_history": chat_history, "retry_count": 0, "llm_provider": llm_provider, "user_id": user_id}
     config = {"configurable": {"thread_id": thread_id}}
     
     # Yield initial status
     yield json.dumps({"type": "status", "content": "Starting Agent..."}) + "\n"
+    
+    final_answer = ""  # Track AI response for memory storage
     
     try:
         for output in app_graph.stream(inputs, config=config):
@@ -906,11 +1074,13 @@ def stream_question(question: str, chat_history: List[Dict[str, str]] = [], llm_
                 elif node_name == "rag_agent":
                     yield json.dumps({"type": "status", "content": "Consulting Knowledge Base..."}) + "\n"
                     if "final_answer" in state_update:
-                        yield json.dumps({"type": "answer", "content": state_update["final_answer"]}) + "\n"
+                        final_answer = state_update["final_answer"]
+                        yield json.dumps({"type": "answer", "content": final_answer}) + "\n"
                 elif node_name == "forecaster":
                     yield json.dumps({"type": "status", "content": "Calculating Prediction..."}) + "\n"
                     if "final_answer" in state_update:
-                        yield json.dumps({"type": "answer", "content": state_update["final_answer"]}) + "\n"
+                        final_answer = state_update["final_answer"]
+                        yield json.dumps({"type": "answer", "content": final_answer}) + "\n"
                 elif node_name == "postgres_agent":
                     yield json.dumps({"type": "status", "content": "Querying Postgres Database..."}) + "\n"
                     if "sql_query" in state_update:
@@ -923,39 +1093,74 @@ def stream_question(question: str, chat_history: List[Dict[str, str]] = [], llm_
                 elif node_name == "analyst":
                     yield json.dumps({"type": "status", "content": "Analyzing Data..."}) + "\n"
                     if "final_answer" in state_update:
-                        response_payload = {"type": "answer", "content": state_update["final_answer"]}
+                        final_answer = state_update["final_answer"]
+                        response_payload = {"type": "answer", "content": final_answer}
                         if "chart_data" in state_update and state_update["chart_data"]:
                             response_payload["chart_data"] = state_update["chart_data"]
                         yield json.dumps(response_payload) + "\n"
                 elif node_name == "general_chat":
-                    if "final_answer" in state_update:
-                        yield json.dumps({"type": "answer", "content": state_update["final_answer"]}) + "\n"
+                    # Check if we should stream the LLM response token by token
+                    if state_update.get("stream_response"):
+                        yield json.dumps({"type": "status", "content": "Generating response..."}) + "\n"
+                        # Stream LLM response token by token
+                        llm = get_llm(inputs.get("llm_provider", "local"))
+                        prompt = state_update.get("stream_prompt", "")
+                        streamed_content = ""
+                        for chunk in llm.stream([HumanMessage(content=prompt)]):
+                            token = chunk.content
+                            if token:
+                                streamed_content += token
+                                yield json.dumps({"type": "token", "content": token}) + "\n"
+                        # Send final answer marker
+                        final_answer = streamed_content
+                        yield json.dumps({"type": "answer_end", "content": final_answer}) + "\n"
+                    elif "final_answer" in state_update:
+                        final_answer = state_update["final_answer"]
+                        yield json.dumps({"type": "answer", "content": final_answer}) + "\n"
                 elif node_name == "ds_router":
                     yield json.dumps({"type": "status", "content": "Routing Data Science Task..."}) + "\n"
                 elif node_name == "spark_engine":
                     yield json.dumps({"type": "status", "content": "Processing step: spark_engine..."}) + "\n"
                     if "final_answer" in state_update:
-                        response_payload = {"type": "answer", "content": state_update["final_answer"]}
+                        final_answer = state_update["final_answer"]
+                        response_payload = {"type": "answer", "content": final_answer}
                         if "chart_data" in state_update:
                             response_payload["chart_data"] = state_update["chart_data"]
                         if "chart_type" in state_update:
                              response_payload["chart_type"] = state_update["chart_type"]
                         yield json.dumps(response_payload) + "\n"
                 elif node_name == "pandas_engine":
-                    yield json.dumps({"type": "status", "content": "Running Advanced Analytics (Pandas)..."}) + "\n"
+                    yield json.dumps({"type": "status", "content": "Processing step: pandas_engine..."}) + "\n"
                     if "final_answer" in state_update:
-                        response_payload = {"type": "answer", "content": state_update["final_answer"]}
+                        final_answer = state_update["final_answer"]
+                        response_payload = {"type": "answer", "content": final_answer}
                         if "chart_data" in state_update:
                             response_payload["chart_data"] = state_update["chart_data"]
-                        if "chart_type" in state_update:
-                             response_payload["chart_type"] = state_update["chart_type"]
                         if "chart_type" in state_update:
                              response_payload["chart_type"] = state_update["chart_type"]
                         yield json.dumps(response_payload) + "\n"
                 elif node_name == "mcp_agent":
                     yield json.dumps({"type": "status", "content": "Consulting MCP Tools..."}) + "\n"
                     if "final_answer" in state_update:
-                        yield json.dumps({"type": "answer", "content": state_update["final_answer"]}) + "\n"
+                        final_answer = state_update["final_answer"]
+                        yield json.dumps({"type": "answer", "content": final_answer}) + "\n"
+                        
+        # --- Store Memory ---
+        # Store both user question and AI response in Mem0
+        try:
+            memory.add(f"User asked: {question}", user_id=user_id)
+            if final_answer:
+                # Store a summary of AI response (first 500 chars to avoid noise)
+                ai_summary = final_answer[:500] if len(final_answer) > 500 else final_answer
+                memory.add(f"AI responded: {ai_summary}", user_id=user_id)
+        except Exception as mem_error:
+            print(f"Memory storage error: {mem_error}")
+        
+    except Exception as e:
+        print(f"Error in stream_question: {e}")
+        yield json.dumps({"type": "error", "content": str(e)}) + "\n"
+
+
                         
     except Exception as e:
         print(f"Streaming Error: {e}")

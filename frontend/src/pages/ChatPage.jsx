@@ -17,46 +17,130 @@ const ChatPage = () => {
     const [llmProvider, setLlmProvider] = useState('local');
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
-    const [status, setStatus] = useState(''); // For intermediate steps
+    const [status, setStatus] = useState('');
+
+    // --- Thread State ---
+    const [threads, setThreads] = useState([]);
+    const [activeThreadId, setActiveThreadId] = useState(null);
+    const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
     const messagesEndRef = useRef(null);
     const navigate = useNavigate();
+    const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
     const scrollToBottom = () => {
-        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        setTimeout(() => {
+            messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+        }, 100);
     };
 
     useEffect(() => {
         scrollToBottom();
     }, [messages, status]);
 
-    // Fetch chat history on mount using auth user
+    // Fetch threads on mount
     useEffect(() => {
-        const fetchHistory = async () => {
+        const fetchThreads = async () => {
             if (!user || !token) return;
-
             try {
-                const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-                const res = await axios.get(`${apiUrl}/chat/my-history`, {
+                const res = await axios.get(`${apiUrl}/threads`, {
                     headers: { Authorization: `Bearer ${token}` }
                 });
+                setThreads(res.data || []);
+                // Auto-select first thread if exists
                 if (res.data && res.data.length > 0) {
-                    const historyMsgs = res.data.map(item => ({
-                        role: item.role,
-                        content: item.content,
-                        chart_data: item.metadata?.chart_data
-                    }));
-                    setMessages(historyMsgs);
+                    loadThread(res.data[0].thread_id);
                 }
             } catch (err) {
-                console.error("Error fetching chat history:", err);
+                console.error("Error fetching threads:", err);
             }
         };
-        fetchHistory();
+        fetchThreads();
     }, [user, token]);
 
     const handleLogout = () => {
         logout();
         navigate('/login');
+    };
+
+    const handleResetChat = () => {
+        setMessages([
+            { role: 'agent', content: 'Hello! I am your AI Data Assistant. I can help you analyze machine performance, query databases, and troubleshoot anomalies.' }
+        ]);
+        setStatus('');
+    };
+
+    // --- Thread Handlers ---
+    const loadThread = async (threadId) => {
+        console.log("loadThread called with threadId:", threadId);
+        try {
+            const res = await axios.get(`${apiUrl}/threads/${threadId}`, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            console.log("loadThread response:", res.data);
+            setActiveThreadId(threadId);
+            if (res.data && res.data.length > 0) {
+                const threadMsgs = res.data.map(item => ({
+                    role: item.role,
+                    content: item.content,
+                    chart_data: item.metadata?.chart_data
+                }));
+                console.log("Setting messages:", threadMsgs.length);
+                setMessages(threadMsgs);
+            } else {
+                console.log("No messages, setting default greeting");
+                setMessages([{ role: 'agent', content: 'Hello! I am your AI Data Assistant. I can help you analyze machine performance, query databases, and troubleshoot anomalies.' }]);
+            }
+        } catch (err) {
+            console.error("Error loading thread:", err);
+        }
+    };
+
+    const createNewThread = async () => {
+        try {
+            const res = await axios.post(`${apiUrl}/threads`, {}, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            const newThread = { thread_id: res.data.thread_id, title: res.data.title };
+            setThreads(prev => [newThread, ...prev]);
+            setActiveThreadId(res.data.thread_id);
+            setMessages([{ role: 'agent', content: 'Hello! I am your AI Data Assistant. I can help you analyze machine performance, query databases, and troubleshoot anomalies.' }]);
+        } catch (err) {
+            console.error("Error creating thread:", err);
+        }
+    };
+
+    // Refresh thread list (to update titles after first message)
+    const refreshThreads = async () => {
+        try {
+            const res = await axios.get(`${apiUrl}/threads`, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            setThreads(res.data || []);
+        } catch (err) {
+            console.error("Error refreshing threads:", err);
+        }
+    };
+
+    const deleteThread = async (threadId) => {
+        try {
+            await axios.delete(`${apiUrl}/threads/${threadId}`, {
+                headers: { Authorization: `Bearer ${token}` }
+            });
+            setThreads(prev => prev.filter(t => t.thread_id !== threadId));
+            if (activeThreadId === threadId) {
+                // Select another thread or reset
+                const remaining = threads.filter(t => t.thread_id !== threadId);
+                if (remaining.length > 0) {
+                    loadThread(remaining[0].thread_id);
+                } else {
+                    setActiveThreadId(null);
+                    handleResetChat();
+                }
+            }
+        } catch (err) {
+            console.error("Error deleting thread:", err);
+        }
     };
 
     const handleSubmit = async (e) => {
@@ -68,6 +152,22 @@ const ChatPage = () => {
         setInput('');
         setLoading(true);
         setStatus('Starting...');
+
+        // Auto-create thread if none is active
+        let currentThreadId = activeThreadId;
+        if (!currentThreadId) {
+            try {
+                const res = await axios.post(`${apiUrl}/threads`, {}, {
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+                currentThreadId = res.data.thread_id;
+                const newThread = { thread_id: currentThreadId, title: res.data.title };
+                setThreads(prev => [newThread, ...prev]);
+                setActiveThreadId(currentThreadId);
+            } catch (err) {
+                console.error("Error auto-creating thread:", err);
+            }
+        }
 
         try {
             const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -87,7 +187,8 @@ const ChatPage = () => {
                     question: userMsg,
                     chat_history: chatHistory,
                     llm_provider: llmProvider,
-                    user_id: user?.id || 'anonymous' // Use authenticated user ID
+                    thread_id: currentThreadId,
+                    user_id: user?.id || 'anonymous'
                 }),
             });
 
@@ -115,6 +216,35 @@ const ChatPage = () => {
                             setStatus(data.content);
                         } else if (data.type === 'log') {
                             console.log("Agent Log:", data.content);
+                        } else if (data.type === 'token') {
+                            // Streaming token - append to current message or create new one
+                            setMessages(prev => {
+                                const lastMsg = prev[prev.length - 1];
+                                if (lastMsg && lastMsg.role === 'agent' && lastMsg.streaming) {
+                                    // Append to existing streaming message
+                                    return [
+                                        ...prev.slice(0, -1),
+                                        { ...lastMsg, content: lastMsg.content + data.content }
+                                    ];
+                                } else {
+                                    // Create new streaming message
+                                    return [...prev, { role: 'agent', content: data.content, streaming: true }];
+                                }
+                            });
+                            setStatus('');
+                        } else if (data.type === 'answer_end') {
+                            // Streaming complete - finalize the message
+                            setMessages(prev => {
+                                const lastMsg = prev[prev.length - 1];
+                                if (lastMsg && lastMsg.streaming) {
+                                    return [
+                                        ...prev.slice(0, -1),
+                                        { ...lastMsg, streaming: false }
+                                    ];
+                                }
+                                return prev;
+                            });
+                            setStatus('');
                         } else if (data.type === 'answer') {
                             setMessages(prev => [...prev, {
                                 role: 'agent',
@@ -138,6 +268,8 @@ const ChatPage = () => {
         } finally {
             setLoading(false);
             setStatus(''); // Ensure status is cleared
+            // Refresh thread list to update titles
+            refreshThreads();
         }
     };
 
@@ -281,6 +413,13 @@ const ChatPage = () => {
                     >
                         📚
                     </button>
+                    <button
+                        onClick={handleResetChat}
+                        style={{ ...styles.iconBtn, backgroundColor: 'rgba(251, 191, 36, 0.2)' }}
+                        title="Reset Chat"
+                    >
+                        🔄
+                    </button>
                     {isAdmin && (
                         <button
                             onClick={() => navigate('/admin')}
@@ -300,112 +439,165 @@ const ChatPage = () => {
                 </div>
             </header>
 
-            {/* Main Chat Area */}
-            <div style={styles.chatArea}>
-                <div style={styles.messagesContainer}>
-                    {messages.map((msg, idx) => (
-                        <div key={idx} style={{
-                            ...styles.messageRow,
-                            justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start'
-                        }}>
-                            {msg.role === 'agent' && (
-                                <div style={styles.avatar}>AI</div>
-                            )}
-                            <div style={{
-                                ...styles.bubble,
-                                backgroundColor: msg.role === 'user' ? '#6366f1' : '#1e293b',
-                                color: '#f8fafc',
-                                borderBottomRightRadius: msg.role === 'user' ? '4px' : '16px',
-                                borderBottomLeftRadius: msg.role === 'agent' ? '4px' : '16px',
-                                marginLeft: msg.role === 'agent' ? '0.5rem' : '0',
-                                marginRight: msg.role === 'user' ? '0' : '0',
-                                whiteSpace: msg.role === 'user' ? 'pre-wrap' : 'normal', // Only pre-wrap user text
-                            }}>
-                                {msg.role === 'agent' ? (
-                                    <div className="markdown-content" id={`msg-${idx}`}>
-                                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                            {msg.content}
-                                        </ReactMarkdown>
-                                    </div>
-                                ) : (
-                                    msg.content
-                                )}
-
-                                {/* Chart Rendering */}
-                                {msg.chart_data && msg.chart_data.length > 0 && (
-                                    <div style={{ marginTop: '1rem', width: '100%', height: '250px' }}>
-                                        <ResponsiveContainer width="100%" height="100%">
-                                            <LineChart data={msg.chart_data}>
-                                                <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                                                <XAxis
-                                                    dataKey="timestamp"
-                                                    stroke="#94a3b8"
-                                                    tick={{ fontSize: 12 }}
-                                                    tickFormatter={(tick) => new Date(tick).toLocaleTimeString()}
-                                                />
-                                                <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                                                <Tooltip
-                                                    contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155' }}
-                                                    itemStyle={{ color: '#f8fafc' }}
-                                                />
-                                                <Line type="monotone" dataKey="vibration" stroke="#8884d8" strokeWidth={2} dot={false} />
-                                                <Line type="monotone" dataKey="temperature" stroke="#82ca9d" strokeWidth={2} dot={false} />
-                                            </LineChart>
-                                        </ResponsiveContainer>
-                                    </div>
-                                )}
-
-                                {/* Download Button for Agent Messages */}
-                                {msg.role === 'agent' && (
-                                    <button
-                                        onClick={() => {
-                                            // Find the preceding user message
-                                            const prevMsg = messages[idx - 1];
-                                            const question = prevMsg && prevMsg.role === 'user' ? prevMsg.content : "Analysis Result";
-                                            handleDownloadPDF(`msg-${idx}`, question);
-                                        }}
-                                        style={styles.downloadBtn}
-                                        title="Download PDF Report"
-                                    >
-                                        📥 Download Report
-                                    </button>
-                                )}
-                            </div>
-                        </div>
-                    ))}
-
-                    {/* Status / Loading Indicator */}
-                    {(loading || status) && (
-                        <div style={styles.statusRow}>
-                            <div style={styles.statusBubble}>
-                                <span className="typing-dot"></span>
-                                <span style={{ marginLeft: '8px' }}>{status || 'Processing...'}</span>
-                            </div>
-                        </div>
-                    )}
-
-                    <div ref={messagesEndRef} />
-                </div>
-            </div>
-
-            {/* Input Area */}
-            <div style={styles.inputContainer}>
-                <form onSubmit={handleSubmit} style={styles.inputWrapper}>
-                    <input
-                        type="text"
-                        value={input}
-                        onChange={(e) => setInput(e.target.value)}
-                        placeholder="Ask about machine status, anomalies, or sensor data..."
-                        style={styles.input}
-                        disabled={loading}
-                    />
-                    <button type="submit" style={styles.sendButton} disabled={loading || !input.trim()}>
-                        ➤
+            {/* Main Layout with Sidebar */}
+            <div style={styles.mainLayout}>
+                {/* Thread Sidebar */}
+                <aside style={{
+                    ...styles.sidebar,
+                    width: sidebarCollapsed ? '50px' : '250px'
+                }}>
+                    <button
+                        onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+                        style={styles.collapseBtn}
+                        title={sidebarCollapsed ? "Expand" : "Collapse"}
+                    >
+                        {sidebarCollapsed ? '→' : '←'}
                     </button>
-                </form>
-            </div>
 
-            <style>{`
+                    {!sidebarCollapsed && (
+                        <>
+                            <button onClick={createNewThread} style={styles.newThreadBtn}>
+                                ➕ New Thread
+                            </button>
+
+                            <div style={styles.threadList}>
+                                {threads.map((thread) => (
+                                    <div
+                                        key={thread.thread_id}
+                                        onClick={() => loadThread(thread.thread_id)}
+                                        style={{
+                                            ...styles.threadItem,
+                                            backgroundColor: activeThreadId === thread.thread_id
+                                                ? 'rgba(99, 102, 241, 0.3)'
+                                                : 'transparent'
+                                        }}
+                                    >
+                                        <div style={styles.threadTitle}>
+                                            💬 {thread.title}
+                                        </div>
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                deleteThread(thread.thread_id);
+                                            }}
+                                            style={styles.deleteThreadBtn}
+                                            title="Delete Thread"
+                                        >
+                                            🗑️
+                                        </button>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
+                    )}
+                </aside>
+
+                {/* Chat Area */}
+                <div style={styles.chatArea}>
+                    <div style={styles.messagesContainer}>
+                        {messages.map((msg, idx) => (
+                            <div key={idx} style={{
+                                ...styles.messageRow,
+                                justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start'
+                            }}>
+                                {msg.role === 'agent' && (
+                                    <div style={styles.avatar}>AI</div>
+                                )}
+                                <div style={{
+                                    ...styles.bubble,
+                                    backgroundColor: msg.role === 'user' ? '#6366f1' : '#1e293b',
+                                    color: '#f8fafc',
+                                    borderBottomRightRadius: msg.role === 'user' ? '4px' : '16px',
+                                    borderBottomLeftRadius: msg.role === 'agent' ? '4px' : '16px',
+                                    marginLeft: msg.role === 'agent' ? '0.5rem' : '0',
+                                    marginRight: msg.role === 'user' ? '0' : '0',
+                                    whiteSpace: msg.role === 'user' ? 'pre-wrap' : 'normal', // Only pre-wrap user text
+                                }}>
+                                    {msg.role === 'agent' ? (
+                                        <div className="markdown-content" id={`msg-${idx}`}>
+                                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                                {msg.content}
+                                            </ReactMarkdown>
+                                        </div>
+                                    ) : (
+                                        msg.content
+                                    )}
+
+                                    {/* Chart Rendering */}
+                                    {msg.chart_data && msg.chart_data.length > 0 && (
+                                        <div style={{ marginTop: '1rem', width: '100%', height: '250px' }}>
+                                            <ResponsiveContainer width="100%" height="100%">
+                                                <LineChart data={msg.chart_data}>
+                                                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                                                    <XAxis
+                                                        dataKey="timestamp"
+                                                        stroke="#94a3b8"
+                                                        tick={{ fontSize: 12 }}
+                                                        tickFormatter={(tick) => new Date(tick).toLocaleTimeString()}
+                                                    />
+                                                    <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} />
+                                                    <Tooltip
+                                                        contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155' }}
+                                                        itemStyle={{ color: '#f8fafc' }}
+                                                    />
+                                                    <Line type="monotone" dataKey="vibration" stroke="#8884d8" strokeWidth={2} dot={false} />
+                                                    <Line type="monotone" dataKey="temperature" stroke="#82ca9d" strokeWidth={2} dot={false} />
+                                                </LineChart>
+                                            </ResponsiveContainer>
+                                        </div>
+                                    )}
+
+                                    {/* Download Button for Agent Messages */}
+                                    {msg.role === 'agent' && (
+                                        <button
+                                            onClick={() => {
+                                                // Find the preceding user message
+                                                const prevMsg = messages[idx - 1];
+                                                const question = prevMsg && prevMsg.role === 'user' ? prevMsg.content : "Analysis Result";
+                                                handleDownloadPDF(`msg-${idx}`, question);
+                                            }}
+                                            style={styles.downloadBtn}
+                                            title="Download PDF Report"
+                                        >
+                                            📥 Download Report
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        ))}
+
+                        {/* Status / Loading Indicator */}
+                        {(loading || status) && (
+                            <div style={styles.statusRow}>
+                                <div style={styles.statusBubble}>
+                                    <span className="typing-dot"></span>
+                                    <span style={{ marginLeft: '8px' }}>{status || 'Processing...'}</span>
+                                </div>
+                            </div>
+                        )}
+
+                        <div ref={messagesEndRef} />
+                    </div>
+                </div>
+
+                {/* Input Area */}
+                <div style={styles.inputContainer}>
+                    <form onSubmit={handleSubmit} style={styles.inputWrapper}>
+                        <input
+                            type="text"
+                            value={input}
+                            onChange={(e) => setInput(e.target.value)}
+                            placeholder="Ask about machine status, anomalies, or sensor data..."
+                            style={styles.input}
+                            disabled={loading}
+                        />
+                        <button type="submit" style={styles.sendButton} disabled={loading || !input.trim()}>
+                            ➤
+                        </button>
+                    </form>
+                </div>
+
+                <style>{`
         .typing-dot {
           width: 8px;
           height: 8px;
@@ -489,8 +681,9 @@ const ChatPage = () => {
           text-decoration: underline;
         }
       `}</style>
-            {showKB && <KnowledgeBaseModal onClose={() => setShowKB(false)} />}
-        </div >
+                {showKB && <KnowledgeBaseModal onClose={() => setShowKB(false)} />}
+            </div>{/* End mainLayout */}
+        </div>
     );
 };
 
@@ -537,7 +730,7 @@ const styles = {
     chatArea: {
         flex: 1,
         overflowY: 'auto',
-        padding: '100px 2rem 140px 2rem', // Large padding for top header and bottom input
+        padding: '120px 2rem 140px 2rem', // Increased top padding to clear navbar
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
@@ -545,7 +738,7 @@ const styles = {
     },
     messagesContainer: {
         width: '100%',
-        maxWidth: '1200px',
+        maxWidth: '800px', // Constrained width
         display: 'flex',
         flexDirection: 'column',
         gap: '1rem',
@@ -607,7 +800,7 @@ const styles = {
     },
     inputWrapper: {
         width: '100%',
-        maxWidth: '1200px',
+        maxWidth: '800px', // Constrained width
         position: 'relative',
         display: 'flex',
         alignItems: 'center',
@@ -668,7 +861,83 @@ const styles = {
         gap: '6px',
         marginLeft: 'auto',
         fontWeight: '500'
-    }
+    },
+    // --- Sidebar Styles ---
+    mainLayout: {
+        display: 'flex',
+        flex: 1,
+        marginTop: '70px',
+        height: 'calc(100vh - 70px)',
+    },
+    sidebar: {
+        backgroundColor: '#1e293b',
+        borderRight: '1px solid #334155',
+        display: 'flex',
+        flexDirection: 'column',
+        padding: '1rem',
+        transition: 'width 0.3s ease',
+        overflowY: 'auto',
+        position: 'fixed',
+        top: '70px',
+        left: 0,
+        height: 'calc(100vh - 70px)',
+        zIndex: 40,
+    },
+    collapseBtn: {
+        background: 'transparent',
+        border: '1px solid #475569',
+        color: '#94a3b8',
+        padding: '0.5rem',
+        borderRadius: '6px',
+        cursor: 'pointer',
+        marginBottom: '1rem',
+        fontSize: '1rem',
+    },
+    newThreadBtn: {
+        background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)',
+        border: 'none',
+        color: 'white',
+        padding: '0.75rem 1rem',
+        borderRadius: '8px',
+        cursor: 'pointer',
+        marginBottom: '1rem',
+        fontSize: '0.9rem',
+        fontWeight: '500',
+        display: 'flex',
+        alignItems: 'center',
+        gap: '0.5rem',
+    },
+    threadList: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '0.5rem',
+    },
+    threadItem: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '0.75rem',
+        borderRadius: '8px',
+        cursor: 'pointer',
+        transition: 'background-color 0.2s',
+        border: '1px solid transparent',
+    },
+    threadTitle: {
+        flex: 1,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        fontSize: '0.85rem',
+        color: '#cbd5e1',
+    },
+    deleteThreadBtn: {
+        background: 'transparent',
+        border: 'none',
+        cursor: 'pointer',
+        fontSize: '0.9rem',
+        opacity: 0.5,
+        transition: 'opacity 0.2s',
+    },
 };
 
 export default ChatPage;

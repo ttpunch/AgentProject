@@ -42,6 +42,16 @@ services:
     networks:
       - cnc_network
 
+  qdrant:
+    image: qdrant/qdrant
+    container_name: cnc_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - cnc_network
+
 networks:
   cnc_network:
     driver: bridge
@@ -49,3 +59,4 @@ networks:
 volumes:
 
   mongo_data:
+  qdrant_data:

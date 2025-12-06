@@ -114,7 +114,7 @@ class DataScienceAgent:
         # Fetch from Postgres
         pg = PostgresConnector()
         try:
-            query = "SELECT * FROM sensor_data"
+            query = "SELECT * FROM cotmac_iiot"
             if machine_id:
                 query += f" WHERE machine_id = '{machine_id}'"
             query += f" ORDER BY timestamp DESC LIMIT {limit}"
@@ -126,7 +126,7 @@ class DataScienceAgent:
             print(f"Error fetching from Postgres: {e}")
         finally:
             pg.close()
-
+            
         # Combine DataFrames
         combined_df = pd.concat([mongo_df, pg_df], ignore_index=True)
         
@@ -294,8 +294,14 @@ class DataScienceAgent:
         
         prompt = f"""
         Classify the user's request into one of these engines:
-        1. SPARK: If the user mentions "Spark", "Big Data", "Batch", "Hadoop", "Cluster", or requests heavy aggregation like "monthly stats", "yearly average", "count all".
-        2. PANDAS: For standard requests like "Anomaly Detection", "RUL", "Forecast", "Real-time", "Predict", "Outliers".
+        1. SPARK: 
+           - If the user explicitly mentions "Spark", "Big Data", "Batch", "Hadoop".
+           - OR if the request implies aggregation over the *entire* large dataset (e.g., "monthly stats", "count all", "yearly average", "group by machine").
+           - OR if the request is SQL-heavy logic on large volume.
+        2. PANDAS: 
+           - For "Machine Learning" tasks: "Anomaly Detection", "RUL", "Forecast", "Train model".
+           - For "Real-time" or specific small window analysis (e.g. "last hour").
+           - For complex statistical models not easily done in SQL (Isolation Forest, VAR, Random Forest).
         
         Chat History:
         {chat_history}
